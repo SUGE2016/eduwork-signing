@@ -6,8 +6,7 @@ on:
     inputs:
       source_repo:
         description: 'Optional allowlisted source override for owner testing'
-        type: choice
-        options: ['', 'ECNU/EduWork', 'SUGE2016/EduWork']
+        type: string
       source_tag:
         description: 'Optional existing published tag; blank discovers new releases'
         type: string
