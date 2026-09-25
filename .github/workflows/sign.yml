@@ -4,6 +4,10 @@ on:
     - cron: '7,17,27,37,47,57 * * * *'
   workflow_dispatch:
     inputs:
+      source_repo:
+        description: 'Optional allowlisted source override for owner testing'
+        type: choice
+        options: ['', 'ECNU/EduWork', 'SUGE2016/EduWork']
       source_tag:
         description: 'Optional existing published tag; blank discovers new releases'
         type: string
@@ -34,7 +38,7 @@ jobs:
       - id: discover
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_REPO: ${{ vars.SOURCE_REPO }}
+          SOURCE_REPO: ${{ inputs.source_repo || vars.SOURCE_REPO }}
           SIGN_FROM: ${{ vars.SIGN_FROM }}
           SOURCE_TAG: ${{ inputs.source_tag }}
         run: python3 scripts/service.py discover
@@ -69,7 +73,7 @@ jobs:
         if: needs.discover.outputs.task == 'new'
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_REPO: ${{ vars.SOURCE_REPO }}
+          SOURCE_REPO: ${{ inputs.source_repo || vars.SOURCE_REPO }}
           SOURCE_ID: ${{ needs.discover.outputs.source_release_id }}
         run: python3 scripts/service.py prepare "$SOURCE_ID"
       - name: Sign App and package DMG
