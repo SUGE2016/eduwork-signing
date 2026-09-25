@@ -62,17 +62,25 @@ def mounted(image, readonly=True):
         args = ['hdiutil', 'attach', image, '-nobrowse', '-noautoopen', '-mountpoint', mount]
         if readonly:
             args.append('-readonly')
-        run(*args)
+        attached = plistlib.loads(run(*args, '-plist').encode())
+        device = next(e['dev-entry'] for e in attached['system-entities'] if e.get('dev-entry'))
         try:
             yield mount
         finally:
             if not readonly:
                 run('sync')
-            try:
-                run('hdiutil', 'detach', mount)
-            except subprocess.CalledProcessError:
-                # Only detach the temporary image mounted by this context.
-                run('hdiutil', 'detach', '-force', mount)
+            for force in (False, True):
+                try:
+                    run('hdiutil', 'detach', device, *(['-force'] if force else []))
+                    break
+                except subprocess.CalledProcessError:
+                    # DiskArbitration can finish detaching after reporting a timeout.
+                    images = plistlib.loads(run('hdiutil', 'info', '-plist').encode())['images']
+                    if not any(Path(i['image-path']).resolve() == Path(image).resolve() for i in images):
+                        break
+                    if force:
+                        raise
+
 
 
 @contextlib.contextmanager
@@ -145,13 +153,16 @@ def sign_app(app, identity, work):
 
 def package(input_path, app, output, work):
     if input_path.suffix == '.dmg':
+        print('Repack source DMG, preserving Finder layout', flush=True)
         # Preserve the source DMG's volume metadata, background and Finder layout.
         rw = work / 'installer-rw.dmg'
         run('hdiutil', 'convert', input_path, '-format', 'UDRW', '-o', rw)
         size = sum(p.stat().st_size for p in app.rglob('*') if p.is_file() and not p.is_symlink())
         minimum = int(run('hdiutil', 'resize', '-limits', rw).split()[0]) * 512
         target = max(minimum + 1024**3, size * 3 + 512 * 1024**2)
+        print('Resize writable DMG', flush=True)
         run('hdiutil', 'resize', '-size', f'{(target + 1024**2 - 1) // 1024**2}m', rw)
+        print('Replace application in writable DMG', flush=True)
         with mounted(rw, readonly=False) as mount:
             existing = list(mount.glob('*.app'))
             if len(existing) != 1 or existing[0].name != app.name:
@@ -159,6 +170,7 @@ def package(input_path, app, output, work):
             shutil.rmtree(existing[0])
             run('ditto', '--noqtn', app, mount / app.name)
             run('codesign', '--verify', '--deep', '--strict', mount / app.name)
+        print('Compress final DMG', flush=True)
         run('hdiutil', 'convert', rw, '-format', 'UDZO', '-o', output)
     else:
         stage = work / 'dmg-root'
@@ -207,4 +219,5 @@ if __name__ == '__main__':
     try:
         main()
     except subprocess.CalledProcessError as error:
-        raise SystemExit(f'External signing operation failed (exit {error.returncode}); see preceding tool diagnostics.') from None
+        operation = ' '.join(str(v) for v in error.cmd[:2]) if error.cmd[0] == 'hdiutil' else str(error.cmd[0])
+        raise SystemExit(f'{operation}: external signing operation failed (exit {error.returncode}); see preceding tool diagnostics.') from None
