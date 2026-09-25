@@ -1,0 +1,150 @@
+name: Sign EduWork macOS releases
+on:
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 'Optional existing published tag; blank discovers new releases'
+        type: string
+      inspect_only:
+        description: 'Inspect source without accessing Apple credentials or signing'
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: eduwork-signing
+  cancel-in-progress: false
+jobs:
+  discover:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || vars.SIGNING_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    outputs:
+      task: ${{ steps.discover.outputs.task }}
+      release_id: ${{ steps.discover.outputs.release_id }}
+      source_release_id: ${{ steps.discover.outputs.source_release_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: discover
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REPO: ${{ vars.SOURCE_REPO }}
+          SIGN_FROM: ${{ vars.SIGN_FROM }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: python3 scripts/service.py discover
+  sign:
+    needs: discover
+    if: needs.discover.outputs.task != 'none' && (github.event_name == 'schedule' || inputs.inspect_only == false)
+    runs-on: macos-15
+    timeout-minutes: 45
+    environment: signing
+    permissions:
+      contents: write
+    outputs:
+      ready: ${{ steps.notary.outputs.ready }}
+      release_id: ${{ steps.notary.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check required credentials
+        env:
+          CERT: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          for key in CERT CERT_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            test -n "${!key}" || { echo "Missing configuration: $key"; exit 1; }
+          done
+        shell: bash
+      - name: Download allowlisted source release
+        if: needs.discover.outputs.task == 'new'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REPO: ${{ vars.SOURCE_REPO }}
+          SOURCE_ID: ${{ needs.discover.outputs.source_release_id }}
+        run: python3 scripts/service.py prepare "$SOURCE_ID"
+      - name: Sign App and package DMG
+        if: needs.discover.outputs.task == 'new'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: python3 scripts/sign_macos.py
+      - name: Save signed package as a private draft
+        id: stage
+        if: needs.discover.outputs.task == 'new'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: python3 scripts/service.py stage
+      - name: Configure notarization credentials
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool store-credentials ci-notary --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD"
+      - name: Submit or resume Apple notarization
+        id: notary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXISTING_ID: ${{ needs.discover.outputs.release_id }}
+          NEW_ID: ${{ steps.stage.outputs.release_id }}
+        run: python3 scripts/service.py resume "${EXISTING_ID:-$NEW_ID}"
+      - name: Clean temporary credentials
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/identity.p12"
+          if test -f "$RUNNER_TEMP/eduwork-signing.keychain-db"; then
+            security delete-keychain "$RUNNER_TEMP/eduwork-signing.keychain-db"
+          fi
+          # The ephemeral hosted runner is destroyed after the job, including its notary profile.
+  verify:
+    needs: sign
+    if: needs.sign.outputs.ready == 'true'
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Download exact notarized package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.sign.outputs.release_id }}
+        run: python3 scripts/service.py fetch-ready "$RELEASE_ID"
+      - name: Gatekeeper and isolated application startup
+        run: python3 scripts/verify_macos.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: verification
+          path: |
+            verification.json
+            runtime.log
+          if-no-files-found: warn
+          retention-days: 14
+  publish:
+    needs: [sign, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verification
+      - name: Publish only the verified digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.sign.outputs.release_id }}
+        run: python3 scripts/service.py publish "$RELEASE_ID"
