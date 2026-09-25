@@ -66,7 +66,13 @@ def mounted(image, readonly=True):
         try:
             yield mount
         finally:
-            run('hdiutil', 'detach', mount)
+            if not readonly:
+                run('sync')
+            try:
+                run('hdiutil', 'detach', mount)
+            except subprocess.CalledProcessError:
+                # Only detach the temporary image mounted by this context.
+                run('hdiutil', 'detach', '-force', mount)
 
 
 @contextlib.contextmanager
