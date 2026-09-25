@@ -20,6 +20,9 @@ jobs:
   discover:
     if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || vars.SIGNING_ENABLED == 'true')
     runs-on: ubuntu-latest
+    # Draft releases are only visible to tokens with push access.
+    permissions:
+      contents: write
     outputs:
       task: ${{ steps.discover.outputs.task }}
       release_id: ${{ steps.discover.outputs.release_id }}
@@ -98,6 +101,16 @@ jobs:
           EXISTING_ID: ${{ needs.discover.outputs.release_id }}
           NEW_ID: ${{ steps.stage.outputs.release_id }}
         run: python3 scripts/service.py resume "${EXISTING_ID:-$NEW_ID}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.notary.outputs.ready == 'true'
+        with:
+          name: notarized-package
+          path: |
+            state.json
+            out/*.dmg
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
       - name: Clean temporary credentials
         if: always()
         run: |
@@ -115,11 +128,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Download exact notarized package
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_ID: ${{ needs.sign.outputs.release_id }}
-        run: python3 scripts/service.py fetch-ready "$RELEASE_ID"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: notarized-package
       - name: Gatekeeper and isolated application startup
         run: python3 scripts/verify_macos.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
